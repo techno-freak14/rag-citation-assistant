@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import chromadb
 import fitz
@@ -10,10 +11,10 @@ from openai import OpenAI
 # --- 1. System & Client Initialization ---
 app = FastAPI(title="RAG Citation Assistant API")
 
-# Securely pull the key from the environment instead of hardcoding it
+# Securely pull the key from the environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Initialize the OpenAI client pointing to Groq's free servers
+# Initialize the OpenAI client pointing to Groq's servers
 ai_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY
@@ -30,7 +31,124 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="The research query or topic sentence.")
 
-# --- 5. API Routes ---
+# --- 5. Interactive Frontend Dashboard Route ---
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serves a clean, production-ready web dashboard for the RAG assistant."""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>RAG Research Assistant</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="bg-slate-900 text-slate-100 min-h-screen font-sans">
+        <div class="max-w-4xl mx-auto py-10 px-4">
+            <header class="border-b border-slate-800 pb-6 mb-8">
+                <h1 class="text-3xl font-bold tracking-tight text-white">RAG Research Citation Assistant</h1>
+                <p class="text-slate-400 mt-2">Upload academic papers and generate comprehensive literature reviews with accurate inline source tracking.</p>
+            </header>
+
+            <div class="space-y-8">
+                <section class="bg-slate-800/50 border border-slate-800 rounded-xl p-6 shadow-xl">
+                    <h2 class="text-xl font-semibold text-white mb-4">1. Document Ingestion</h2>
+                    <div class="flex flex-col sm:flex-row gap-4 items-stretch">
+                        <input type="file" id="pdfFile" accept=".pdf" class="block w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 border border-slate-700 rounded-lg p-2 bg-slate-950/50">
+                        <button onclick="uploadDocument()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-lg font-medium transition-all shadow-md shrink-0">Upload PDF</button>
+                    </div>
+                    <p id="uploadStatus" class="mt-3 text-sm font-medium"></p>
+                </section>
+
+                <section class="bg-slate-800/50 border border-slate-800 rounded-xl p-6 shadow-xl">
+                    <h2 class="text-xl font-semibold text-white mb-4">2. Literature Review Generation</h2>
+                    <div class="space-y-4">
+                        <textarea id="searchQuery" rows="3" placeholder="Enter your research query or topic sentence (e.g., Explain the submission requirements for the RAG assistant...)" class="w-full rounded-lg border border-slate-700 bg-slate-950/50 p-4 text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-colors resize-none"></textarea>
+                        <button onclick="submitQuery()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-3 rounded-lg font-semibold transition-all shadow-md tracking-wide">Generate Synthesis with Citations</button>
+                    </div>
+                </section>
+
+                <section id="outputSection" class="hidden bg-slate-950 border border-slate-800 rounded-xl p-6 shadow-2xl transition-all">
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-400 mb-3">Generated Literature Review Synthesis</h3>
+                    <div id="outputContainer" class="prose prose-invert max-w-none text-slate-200 leading-relaxed space-y-4 whitespace-pre-wrap"></div>
+                </section>
+            </div>
+        </div>
+
+        <script>
+            async function uploadDocument() {
+                const fileInput = document.getElementById('pdfFile');
+                const status = document.getElementById('uploadStatus');
+                
+                if (!fileInput.files[0]) {
+                    status.className = "mt-3 text-sm font-medium text-amber-400";
+                    status.innerText = "Please select a valid PDF file first.";
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append("file", fileInput.files[0]);
+
+                status.className = "mt-3 text-sm font-medium text-slate-400 animate-pulse";
+                status.innerText = "Extracting text, computing vector embeddings, and updating ChromaDB...";
+
+                try {
+                    const response = await fetch('/upload', { method: 'POST', body: formData });
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        status.className = "mt-3 text-sm font-medium text-emerald-400";
+                        status.innerText = `Success! Saved ${data.total_chunks_saved} searchable chunks into the local vector storage.`;
+                        fileInput.value = '';
+                    } else {
+                        throw new Error(data.detail || "Upload failed");
+                    }
+                } catch (error) {
+                    status.className = "mt-3 text-sm font-medium text-rose-400";
+                    status.innerText = `Error: ${error.message}`;
+                }
+            }
+
+            async function submitQuery() {
+                const queryText = document.getElementById('searchQuery').value.trim();
+                const outputSection = document.getElementById('outputSection');
+                const outputContainer = document.getElementById('outputContainer');
+                
+                if (!queryText) {
+                    alert("Please enter a research query sentence.");
+                    return;
+                }
+
+                outputSection.classList.remove('hidden');
+                outputContainer.className = "text-slate-400 animate-pulse italic";
+                outputContainer.innerText = "Querying local vector database, evaluating context chunks, and generating cited review with Meta Llama 3.1...";
+
+                try {
+                    const response = await fetch('/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: queryText })
+                    });
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        outputContainer.className = "text-slate-200 leading-relaxed whitespace-pre-wrap";
+                        outputContainer.innerText = data.generated_literature_review;
+                    } else {
+                        throw new Error(data.detail || "Query failed");
+                    }
+                } catch (error) {
+                    outputContainer.className = "text-rose-400 font-medium";
+                    outputContainer.innerText = `System Error: ${error.message}`;
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+# --- 6. API Routes ---
 
 @app.post("/upload")
 async def upload_paper(file: UploadFile = File(...)):
@@ -59,14 +177,10 @@ async def upload_paper(file: UploadFile = File(...)):
     if not chunks:
         raise HTTPException(status_code=400, detail="No readable text found in the PDF.")
     
-    # Generate vector embeddings for all chunks
     embeddings = embedding_model.encode(chunks).tolist()
-    
-    # Create unique IDs and metadata for each chunk
     ids = [f"{file.filename}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [{"filename": file.filename, "chunk_index": i, "text": chunk} for i, chunk in enumerate(chunks)]
     
-    # Save everything into the database
     collection.add(
         ids=ids,
         embeddings=embeddings,
@@ -86,10 +200,8 @@ async def query_system(request: QueryRequest):
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable is missing.")
 
-    # 1. Convert the query into a vector embedding
     query_embedding = embedding_model.encode(request.query).tolist()
     
-    # 2. Search ChromaDB for the top 5 most similar chunks
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=5
@@ -101,13 +213,11 @@ async def query_system(request: QueryRequest):
     retrieved_chunks = results["documents"][0]
     retrieved_metadata = results["metadatas"][0]
     
-    # 3. Format the retrieved text chunks to serve as the LLM's context
     llm_context = ""
     for i, chunk in enumerate(retrieved_chunks):
         source = retrieved_metadata[i]["filename"]
         llm_context += f"--- Document Source: {source} ---\n{chunk}\n\n"
         
-    # 4. Construct the professional, strict prompt for the researcher persona
     system_prompt = (
         "You are an expert AI Research Assistant helping professors write academic literature reviews. "
         "Your task is to synthesize the provided context chunks into a cohesive, professional 2-3 paragraph summary "
@@ -120,7 +230,6 @@ async def query_system(request: QueryRequest):
     
     user_prompt = f"Research Query: {request.query}\n\nRetrieved Academic Context:\n{llm_context}"
     
-    # 5. Execute the call using Groq's active Llama-3.1-8b-instant model
     try:
         response = ai_client.chat.completions.create(
             messages=[
