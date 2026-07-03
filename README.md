@@ -28,7 +28,8 @@ To prevent ML vector encoding from freezing the ASGI event loop, the `/upload` a
 ```bash
 git clone [https://github.com/techno-freak14/rag-citation-assistant.git](https://github.com/techno-freak14/rag-citation-assistant.git)
 cd rag-citation-assistant
-2. Create and activate a virtual environment:
+
+**2. Create and activate a virtual environment:**
 # On Windows
 python -m venv venv
 venv\Scripts\activate
@@ -36,14 +37,18 @@ venv\Scripts\activate
 # On macOS/Linux
 python3 -m venv venv
 source venv/bin/activate
-3. Install dependencies:
+
+**3. Install dependencies:**
 pip install -r requirements.txt
-4.Configure Environment Variables:
+
+**4.Configure Environment Variables:**
 Create a .env file in the root directory (or copy the example file) and add your API key:
 cp .env.example .env
 # Edit .env and set GROQ_API_KEY=your_key_here
-5. Start the Server:
+
+**5. Start the Server:**
 python -m uvicorn main:app --reload --env-file .env
+
 
 ##📡 API Endpoints
 GET / - Serves the interactive web UI dashboard.
