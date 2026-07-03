@@ -1,4 +1,5 @@
 import os
+import re
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -11,10 +12,8 @@ from openai import OpenAI
 # --- 1. System & Client Initialization ---
 app = FastAPI(title="RAG Citation Assistant API")
 
-# Securely pull the key from the environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Initialize the OpenAI client pointing to Groq's servers
 ai_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY
@@ -33,7 +32,7 @@ class QueryRequest(BaseModel):
 
 # --- 5. Interactive Frontend Dashboard Route ---
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
+def serve_frontend():
     """Serves a clean, production-ready web dashboard for the RAG assistant."""
     return """
     <!DOCTYPE html>
@@ -151,37 +150,52 @@ async def serve_frontend():
 # --- 6. API Routes ---
 
 @app.post("/upload")
-async def upload_paper(file: UploadFile = File(...)):
-    """Uploads a PDF, extracts text, chunks it, creates embeddings, and saves to DB."""
-    if not file.filename.endswith(".pdf"):
+def upload_paper(file: UploadFile = File(...)):
+    """Uploads a PDF, extracts text page-by-page, creates embeddings, and upserts to DB."""
+    # Priority 5 Fix: Case-insensitive check
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     
-    file_content = await file.read()
+    # Priority 3 Fix: Read synchronously within standard def block
+    file_content = file.file.read()
+    
+    # Priority 5 Fix: Hard size limit set to 10MB to prevent memory exhaustion
+    if len(file_content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 10MB.")
     
     try:
         pdf_document = fitz.open(stream=file_content, filetype="pdf")
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read the PDF file.")
     
-    full_text = ""
-    for page_num in range(len(pdf_document)):
-        page = pdf_document.load_page(page_num)
-        full_text += page.get_text()
-        
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000, 
         chunk_overlap=200 
     )
-    chunks = text_splitter.split_text(full_text)
     
+    chunks = []
+    metadatas = []
+    
+    # Priority 1 Fix: Process page-by-page to preserve boundaries
+    for page_num in range(len(pdf_document)):
+        page_text = pdf_document.load_page(page_num).get_text()
+        page_chunks = text_splitter.split_text(page_text)
+        
+        for chunk in page_chunks:
+            chunks.append(chunk)
+            # Store the specific page number in metadata (1-indexed). 
+            # Priority 5 Fix: Removed duplicate text payload from metadata.
+            metadatas.append({"filename": file.filename, "page": page_num + 1})
+            
     if not chunks:
         raise HTTPException(status_code=400, detail="No readable text found in the PDF.")
     
+    # Priority 3 Fix: This blocking ML computation is now safely off the event loop
     embeddings = embedding_model.encode(chunks).tolist()
     ids = [f"{file.filename}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [{"filename": file.filename, "chunk_index": i, "text": chunk} for i, chunk in enumerate(chunks)]
     
-    collection.add(
+    # Priority 5 Fix: Using upsert instead of add to handle duplicate re-uploads cleanly
+    collection.upsert(
         ids=ids,
         embeddings=embeddings,
         metadatas=metadatas,
@@ -195,16 +209,18 @@ async def upload_paper(file: UploadFile = File(...)):
     }
 
 @app.post("/query")
-async def query_system(request: QueryRequest):
-    """Retrieves top 5 chunks and uses Llama 3.1 via Groq to generate a cited summary."""
+def query_system(request: QueryRequest):
+    """Retrieves chunks, filters by relevance, generates a summary, and grounds citations."""
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable is missing.")
 
     query_embedding = embedding_model.encode(request.query).tolist()
     
+    # Priority 5 Fix: Include distances to establish a relevance threshold
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=5
+        n_results=5,
+        include=["documents", "metadatas", "distances"]
     )
     
     if not results["documents"] or len(results["documents"][0]) == 0:
@@ -212,18 +228,41 @@ async def query_system(request: QueryRequest):
         
     retrieved_chunks = results["documents"][0]
     retrieved_metadata = results["metadatas"][0]
+    retrieved_distances = results["distances"][0]
     
     llm_context = ""
+    valid_source_indices = []
+    
+    # ChromaDB defaults to L2 distance where smaller is closer.
+    DISTANCE_THRESHOLD = 1.6 
+    
+    # Format numbered sources for the LLM while filtering out noise
     for i, chunk in enumerate(retrieved_chunks):
-        source = retrieved_metadata[i]["filename"]
-        llm_context += f"--- Document Source: {source} ---\n{chunk}\n\n"
+        if retrieved_distances[i] > DISTANCE_THRESHOLD:
+            continue
+            
+        source_idx = i + 1
+        valid_source_indices.append(str(source_idx))
+        filename = retrieved_metadata[i]["filename"]
+        page = retrieved_metadata[i].get("page", "Unknown")
+        
+        # Priority 1 Fix: Explicit source indexing with page numbers
+        llm_context += f"[Source {source_idx}] {filename}, p.{page}\n{chunk}\n\n"
+        
+    # If all chunks exceeded the threshold, intercept the generation
+    if not valid_source_indices:
+        return {
+            "status": "success",
+            "original_query": request.query,
+            "generated_literature_review": "No highly relevant information was found in the uploaded documents to confidently answer this query."
+        }
         
     system_prompt = (
-        "You are an expert AI Research Assistant helping professors write academic literature reviews. "
-        "Your task is to synthesize the provided context chunks into a cohesive, professional 2-3 paragraph summary "
+        "You are an expert AI Research Assistant helping professionals write academic literature reviews. "
+        "Synthesize the provided context chunks into a cohesive, professional 2-3 paragraph summary "
         "that directly answers the user's research query.\n\n"
         "CRITICAL RULES:\n"
-        "1. You must explicitly cite the sources using the filenames provided in the context (e.g., '[filename.pdf]').\n"
+        "1. You must explicitly cite the sources using the EXACT numbered tags provided (e.g., '[Source 1]').\n"
         "2. Do NOT fabricate facts or citations. Rely exclusively on the provided context text.\n"
         "3. Maintain a formal, academic, corporate tone appropriate for a high-level research publication."
     )
@@ -243,6 +282,13 @@ async def query_system(request: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM Generation failed: {str(e)}")
         
+    # Priority 1 Fix: The Grounding Check Validation
+    cited_indices = re.findall(r'\[Source (\d+)\]', generated_summary)
+    
+    for index in set(cited_indices):
+        if index not in valid_source_indices:
+            generated_summary += f"\n\n[SYSTEM WARNING: The model hallucinated an unverified citation: Source {index}]"
+            
     return {
         "status": "success",
         "original_query": request.query,
@@ -250,13 +296,18 @@ async def query_system(request: QueryRequest):
     }
 
 @app.get("/papers")
-async def list_papers():
-    """Lists all uploaded research papers."""
-    return {"status": "success", "papers": []}
+def list_papers():
+    """Lists all uploaded research papers by extracting unique filenames from metadata."""
+    # Priority 2 Fix: Endpoint executes a real database extraction
+    data = collection.get(include=["metadatas"])
+    filenames = sorted({m["filename"] for m in data["metadatas"] if m is not None})
+    return {"status": "success", "papers": filenames}
 
 @app.delete("/papers/{paper_id}")
-async def delete_paper(paper_id: str):
-    """Deletes a specific paper from the system."""
+def delete_paper(paper_id: str):
+    """Deletes a specific paper and all its corresponding chunks from the system."""
+    # Priority 2 Fix: Endpoint executes a real database deletion
     if not paper_id.strip():
         raise HTTPException(status_code=400, detail="Paper ID cannot be empty.")
+    collection.delete(where={"filename": paper_id})
     return {"status": "success", "message": f"Deleted paper {paper_id}"}
